@@ -131,6 +131,8 @@ app.post("/api/chat", async (c) => {
 
 /* ── Start ────────────────────────────────────────────────── */
 const port = Number(process.env.PORT) || 3000;
-serve({ fetch: app.fetch, port }, () => {
-  console.log(`API running on http://localhost:${port}`);
+serve({
+  fetch: app.fetch,
+  port: Number(process.env.PORT) || 3000,
+  hostname: "0.0.0.0",
 });
