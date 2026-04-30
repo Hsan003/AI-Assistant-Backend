@@ -100,7 +100,7 @@ app.post("/api/chat", async (c) => {
   const safeMessages = (messages as any[])
     .slice(-10)
     .map((m) => ({
-      role: m.role === "user" ? "user" : "assistant",
+      role: m.role === "user" ? "user" : "model",
       content: String(m.content).slice(0, 2000),
     }));
 
