@@ -15,6 +15,10 @@ const redis = new Redis({
 });
 const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
+// Tried in order: the next one is used if a model errors (e.g. 503) or times out
+const GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest"];
+const GEMINI_ATTEMPT_TIMEOUT_MS = 12_000;
+
 app.use("*", cors({ origin: "*" }));
 
 /* ── Health check ─────────────────────────────────────────── */
@@ -130,25 +134,33 @@ app.post("/api/chat", async (c) => {
     }));
 
   // 5. Call Gemini
-  // Pinned model: the "gemini-flash-latest" alias can silently move to a model that hangs.
-  // Timeout stays under the widget's 30s chat timeout.
-  const model = genai.getGenerativeModel(
-    {
-      model: "gemini-3.5-flash",
-      systemInstruction: store.system_prompt,
-    },
-    { timeout: 25_000 }
-  );
+  // Lite models: full "flash" models were often overloaded (503) or took 40s+.
+  // If the first model fails or is slow, try the next one.
+  // Per-attempt timeouts add up to < the widget's 30s chat timeout.
+  const history = safeMessages.slice(0, -1).map((m) => ({
+    role: m.role === "user" ? "user" : "model",
+    parts: [{ text: m.content }],
+  }));
+  const lastMessage = safeMessages.at(-1)!.content;
 
-  const chat = model.startChat({
-    history: safeMessages.slice(0, -1).map((m) => ({
-      role: m.role === "user" ? "user" : "model",
-      parts: [{ text: m.content }],
-    })),
-  });
+  let reply: string | undefined;
+  for (const modelName of GEMINI_MODELS) {
+    try {
+      const model = genai.getGenerativeModel(
+        { model: modelName, systemInstruction: store.system_prompt },
+        { timeout: GEMINI_ATTEMPT_TIMEOUT_MS }
+      );
+      const geminiResult = await model.startChat({ history }).sendMessage(lastMessage);
+      reply = geminiResult.response.text();
+      break;
+    } catch (err) {
+      console.error(`[chat] ${modelName} failed:`, err instanceof Error ? err.message : err);
+    }
+  }
 
-  const geminiResult = await chat.sendMessage(safeMessages.at(-1)!.content);
-  const reply = geminiResult.response.text();
+  if (reply === undefined) {
+    return c.json({ error: "AI service is busy, please try again" }, 503);
+  }
 
   // 6. Log usage
   await db.query(
