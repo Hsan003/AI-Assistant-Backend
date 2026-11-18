@@ -24,16 +24,28 @@ app.get("/", (c) => c.json({ status: "ok" }));
 app.get("/api/config/:storeId", async (c) => {
   const { storeId } = c.req.param();
 
+  // v2: camelCase shape (old snake_case cache entries are ignored)
+  const cacheKey = `config:v2:${storeId}`;
+
   // 1. Try Redis cache first
-  const cached = await redis.get(`config:${storeId}`);
+  const cached = await redis.get(cacheKey);
   if (cached) return c.json(cached);
 
   // 2. Query DB — never expose system_prompt
+  // Aliases must match the widget's storeConfigSchema (chatbot-widget/src/schemas/config.ts)
   const result = await db.query(`
     SELECT
-      name, logo_url, primary_color, secondary_color,
-      bg_color, welcome_message, subtitle, position,
-      input_placeholder, powered_by_label, open_on_init
+      name,
+      logo_url          AS "logoUrl",
+      primary_color     AS "primaryColor",
+      secondary_color   AS "secondaryColor",
+      bg_color          AS "backgroundColor",
+      welcome_message   AS "welcomeMessage",
+      subtitle          AS "headerSubtitle",
+      position,
+      input_placeholder AS "inputPlaceholder",
+      powered_by_label  AS "poweredByLabel",
+      open_on_init      AS "openOnInit"
     FROM stores
     WHERE id = $1 AND is_active = true
   `, [storeId]);
@@ -42,10 +54,23 @@ app.get("/api/config/:storeId", async (c) => {
     return c.json({ error: "Store not found" }, 404);
   }
 
-  // 3. Cache for 5 minutes
-  await redis.setex(`config:${storeId}`, 300, JSON.stringify(result.rows[0]));
+  // Drop empty columns: the widget schema accepts missing fields, not null
+  const config = Object.fromEntries(
+    Object.entries(result.rows[0]).filter(([, v]) => v !== null)
+  );
 
-  return c.json(result.rows[0]);
+  // Colors are often saved as "32a852": the widget only accepts "#32a852"
+  for (const key of ["primaryColor", "secondaryColor", "backgroundColor"]) {
+    const v = config[key];
+    if (typeof v === "string" && /^([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v.trim())) {
+      config[key] = `#${v.trim()}`;
+    }
+  }
+
+  // 3. Cache for 5 minutes
+  await redis.setex(cacheKey, 300, JSON.stringify(config));
+
+  return c.json(config);
 });
 
 /* ── POST /api/chat ───────────────────────────────────────── */
@@ -105,10 +130,15 @@ app.post("/api/chat", async (c) => {
     }));
 
   // 5. Call Gemini
-  const model = genai.getGenerativeModel({
-    model: "gemini-flash-latest",
-    systemInstruction: store.system_prompt,
-  });
+  // Pinned model: the "gemini-flash-latest" alias can silently move to a model that hangs.
+  // Timeout stays under the widget's 30s chat timeout.
+  const model = genai.getGenerativeModel(
+    {
+      model: "gemini-3.5-flash",
+      systemInstruction: store.system_prompt,
+    },
+    { timeout: 25_000 }
+  );
 
   const chat = model.startChat({
     history: safeMessages.slice(0, -1).map((m) => ({
